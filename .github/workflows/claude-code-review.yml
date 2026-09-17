@@ -115,6 +115,10 @@ jobs:
         without a posted comment is a failure. Post via `gh pr comment` even if
         the findings are few, low-confidence, or you already tried another
         mechanism. Do this before you run out of turns: budget for it.
+        This also applies when step 1 decides to SKIP: if the PR has no existing
+        Claude comment (as defined in OVERRIDE A), post a two-line comment — the
+        marker line, then one sentence naming the skip reason — and stop. If a
+        Claude comment already exists, skip silently as before.
 
         OVERRIDE D — this is a headless, single-turn session. There is no
         "later": the moment you end your turn the process exits and any
