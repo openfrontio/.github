@@ -173,6 +173,20 @@ jobs:
           npm install -g @anthropic-ai/claude-code@2.1.265
           echo "path=$(command -v claude)" >> "$GITHUB_OUTPUT"
 
+      # Fork mode runs Claude's Bash tool under bubblewrap (the action sets
+      # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 with allowed_non_write_users). The
+      # CLI masks container sockets inside the sandbox, including
+      # /run/containerd/containerd.sock, but on the GitHub Ubuntu image
+      # /run/containerd is root-only (0700), so the unprivileged bwrap cannot
+      # stat the socket and dies with "Can't mkdir parents for
+      # /run/containerd/containerd.sock: Permission denied" on EVERY command,
+      # even `echo`. Seen on every OpenFrontIO run from 2026-09-17 18:00 UTC
+      # (e.g. run 35261386929). Letting the runner user traverse the directory
+      # is enough for the bind; the socket itself stays root:docker 0660.
+      - name: Make masked container sockets stat-able for the sandbox
+        if: env.FORK_MODE == 'true'
+        run: sudo chmod o+rx /run/containerd 2>/dev/null || true
+
       # Primary account. When it is out of usage the action fails in ~15s with
       # a 429 rate_limit result ("You've hit your weekly limit") before posting
       # anything, so a failure here hands off to the backup step below. Any
