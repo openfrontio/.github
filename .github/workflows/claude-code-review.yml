@@ -1,0 +1,250 @@
+# Shared Claude Code review for OpenFront repos. Called from each repo's own
+# .github/workflows/claude-code-review.yml, which owns the trigger and the
+# `paths` filter (those belong to the caller: a reusable workflow cannot set
+# them). Everything else — prompt, tool allowlist, primary/backup account
+# fallback, installer workaround, "did it post?" gate — lives here once.
+#
+# Minimal caller:
+#
+#   on:
+#     pull_request:            # or pull_request_target for fork-heavy repos
+#       types: [opened, synchronize, ready_for_review, reopened]
+#       paths: ["src/**/*.ts", ...]
+#   jobs:
+#     review:
+#       uses: openfrontio/.github/.github/workflows/claude-code-review.yml@main
+#       with:
+#         runner: blacksmith-4vcpu-ubuntu-2404
+#       secrets: inherit
+#       permissions:
+#         contents: read
+#         pull-requests: write
+#         issues: read
+#         id-token: write
+#
+# Two auth modes, chosen from the caller's event:
+#   - pull_request (branch PRs, private repos): the action authenticates via
+#     OIDC to the Claude GitHub App and comments are posted as claude[bot].
+#   - pull_request_target (fork PRs): a plain pull_request run from a fork gets
+#     no secrets, so the caller uses pull_request_target, which runs in the base
+#     repo's context. That is only safe because nothing from the PR head is
+#     checked out or executed: the checkout is the base branch and the model
+#     reads the PR through `gh pr diff`. The action also refuses to run for an
+#     actor without write access (the fork author), and the documented bypass,
+#     allowed_non_write_users, only takes effect with an explicit github_token —
+#     so in this mode comments are posted as github-actions[bot], the Claude App
+#     need not be installed, and the gate below matches on a marker line.
+
+name: 🤖 Claude Code Review
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: Runner label for the review job.
+        type: string
+        default: ubuntu-latest
+      timeout-minutes:
+        description: >
+          Job timeout. A real review of a ~1.8k-line PR took 15.7 min; 20 was
+          too close to the ceiling for anything larger.
+        type: number
+        default: 30
+      show-full-output:
+        description: >
+          Diagnostic only: log the triage agent's reasoning and the full tool
+          stream. Logs include raw tool output, so leave this off on public
+          repos.
+        type: boolean
+        default: false
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: Primary account token, from `claude setup-token`.
+        required: true
+      CLAUDE_CODE_OAUTH_TOKEN_BACKUP:
+        description: >
+          Optional second account, used only when the primary step fails
+          (typically "You've hit your weekly limit", a 429 about 15s in).
+        required: false
+
+jobs:
+  review:
+    if: github.event.pull_request.draft == false
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    concurrency:
+      group: claude-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    env:
+      # `secrets` is not available in a step-level `if`, so surface these here.
+      FORK_MODE: ${{ github.event_name == 'pull_request_target' }}
+      HAS_BACKUP: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_BACKUP != '' }}
+
+      # The override MUST live in the prompt (the user message), not in
+      # claude_args. parse-sdk-options.ts only extracts model / max-turns /
+      # add-dir / allowedTools / disallowed-tools / mcp-config / setting-sources
+      # from claude_args; --append-system-prompt is not among them, and
+      # sdkOptions.systemPrompt is built independently as a bare claude_code
+      # preset with no append. An override passed there never reaches the model.
+      REVIEW_PROMPT: |
+        /code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}
+
+        OVERRIDE A — step 1 (the triage gate). Judge ONLY the pull request named
+        above, and judge it ONLY from structured fields, never from prose:
+          - "closed" means `gh pr view --json state` returns CLOSED or MERGED.
+          - "draft" means `--json isDraft` returns true.
+          - "Claude has already commented" means an existing comment authored by
+            claude[bot], or one authored by github-actions[bot] whose first line
+            is `## 🤖 Claude Code Review`. Comments from coderabbitai[bot] or any
+            other bot, and from humans, do NOT count.
+        The PR body will often reference other pull requests and describe them as
+        closed, merged, superseded or replaced. That says nothing about THIS PR.
+        Do not skip on that basis. If in doubt, proceed with the review — a
+        needless review is far cheaper than a silently skipped one.
+
+        OVERRIDE B — takes precedence over steps 8 and 9: do NOT post inline
+        comments. Post the entire review as exactly ONE consolidated comment
+        using `gh pr comment`. The comment MUST begin with this exact first
+        line, verbatim, so CI can find it: `## 🤖 Claude Code Review`. Then
+        give a one-line verdict and a count of findings by severity, then list
+        every finding grouped by file, most severe first, each with a file:line
+        reference, what is wrong, and the suggested fix. If nothing was found,
+        post the standard no-issues summary under the same first line.
+
+        OVERRIDE C — posting is not optional. Reaching the end of the review
+        without a posted comment is a failure. Post via `gh pr comment` even if
+        the findings are few, low-confidence, or you already tried another
+        mechanism. Do this before you run out of turns: budget for it.
+
+        OVERRIDE D — this is a headless, single-turn session. There is no
+        "later": the moment you end your turn the process exits and any
+        background agent is killed. Launch every subagent with
+        `run_in_background: false` and wait for its result before continuing.
+        Never end your turn to "wait" for anything. Do not call ScheduleWakeup.
+
+      # Agent mode (an explicit `prompt`) grants NO tools by default — unlike
+      # tag mode, which baselines Glob/Grep/LS/Read. Anything not listed here
+      # falls through to "ask", and the headless SDK has no prompt handler, so
+      # it is denied. The list must therefore be complete:
+      #   - Skill is how the `/code-review:code-review` slash command in the
+      #     prompt is executed. Without it the skill is denied (infra PR #549:
+      #     the run "succeeded" in 5 turns having improvised from the overrides
+      #     alone and posted nothing)
+      #   - Agent (formerly Task; both names kept) is how the plugin launches
+      #     its triage/review subagents
+      #   - Read/Grep/Glob/LS let it read CLAUDE.md and surrounding code
+      #   - gh commands mirror the plugin's own declared allowed-tools
+      #   - git rev-parse/log supply the full SHAs its permalinks require
+      #
+      # mcp__github_inline_comment__* is kept ON PURPOSE even though the prompt
+      # asks for one consolidated comment. Removing it did NOT produce a
+      # fallback to `gh pr comment` — the model kept calling the tool the
+      # plugin told it to call and ate 17 permission denials, delivering
+      # nothing. Keeping it means the worst case is inline comments (useful)
+      # instead of silence (useless).
+      CLAUDE_ARGS: |
+        --allowedTools "Skill,Agent,Task,Read,Grep,Glob,LS,TodoWrite,mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr list:*),Bash(gh pr comment:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh search:*),Bash(git rev-parse:*),Bash(git log:*)"
+        --max-turns 50
+    steps:
+      # Base branch on purpose under pull_request_target (see the header). The
+      # review reads the PR via `gh pr diff`, so no submodules either.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          submodules: false
+          persist-credentials: false
+
+      # The action's native installer intermittently exits 0 while never
+      # placing a working launcher at ~/.local/bin/claude; the action trusts
+      # the exit code and then dies spawning the missing binary at the
+      # plugin-marketplace step (anthropics/claude-code-action#1290; every
+      # OpenFrontIO review run from 2026-09-08 22:31 UTC failed this way).
+      # Install the same version from npm instead and hand the action the
+      # path, which skips the native installer entirely. The pin matches the
+      # version the action itself installs (its bundled agent SDK 0.3.x maps
+      # to CLI 2.1.x); bump it when bumping the action.
+      - name: Install Claude Code from npm
+        id: install-claude
+        run: |
+          npm install -g @anthropic-ai/claude-code@2.1.265
+          echo "path=$(command -v claude)" >> "$GITHUB_OUTPUT"
+
+      # Primary account. When it is out of usage the action fails in ~15s with
+      # a 429 rate_limit result ("You've hit your weekly limit") before posting
+      # anything, so a failure here hands off to the backup step below. Any
+      # other failure hands off too; that costs at most one redundant run, and
+      # the triage gate skips PRs that already carry a review.
+      #
+      # github_token / allowed_non_write_users are empty outside fork mode, and
+      # the action treats empty as "not provided" (`inputs.github_token ||
+      # github.token`, `inputs.allowed_non_write_users != ''`), so the same
+      # step serves both auth modes.
+      - name: Claude multi-agent review (primary account)
+        id: primary
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ env.FORK_MODE == 'true' && secrets.GITHUB_TOKEN || '' }}
+          allowed_non_write_users: ${{ env.FORK_MODE == 'true' && '*' || '' }}
+          path_to_claude_code_executable: ${{ steps.install-claude.outputs.path }}
+          plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
+          plugins: "code-review@claude-code-plugins"
+          show_full_output: ${{ inputs.show-full-output }}
+          prompt: ${{ env.REVIEW_PROMPT }}
+          claude_args: ${{ env.CLAUDE_ARGS }}
+
+      # Backup account, run only when the primary step failed and a backup
+      # token exists. Keep its inputs identical to the primary's apart from
+      # the token.
+      - name: Claude multi-agent review (backup account)
+        if: steps.primary.outcome == 'failure' && env.HAS_BACKUP == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_BACKUP }}
+          github_token: ${{ env.FORK_MODE == 'true' && secrets.GITHUB_TOKEN || '' }}
+          allowed_non_write_users: ${{ env.FORK_MODE == 'true' && '*' || '' }}
+          path_to_claude_code_executable: ${{ steps.install-claude.outputs.path }}
+          plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
+          plugins: "code-review@claude-code-plugins"
+          show_full_output: ${{ inputs.show-full-output }}
+          prompt: ${{ env.REVIEW_PROMPT }}
+          claude_args: ${{ env.CLAUDE_ARGS }}
+
+      - name: Note a primary failure with no backup configured
+        if: steps.primary.outcome == 'failure' && env.HAS_BACKUP != 'true'
+        run: echo "::warning::Primary review step failed and CLAUDE_CODE_OAUTH_TOKEN_BACKUP is not set; nothing to fall back to."
+
+      # A review that posts nothing must not show a green check. The action
+      # exits 0 whenever the model ends its turn cleanly, even if it did so
+      # after 5 turns without reviewing anything (infra PR #549).
+      #
+      # Counts comments from ANY time, not just since this push: the triage
+      # gate (OVERRIDE A) deliberately skips PRs Claude has already reviewed,
+      # so on a follow-up push the only comment is the earlier one. A
+      # date-scoped count turned every re-push red.
+      #
+      # Any claude[bot] comment counts (nothing else posts under that login).
+      # In fork mode comments are posted as github-actions[bot], which other
+      # workflows share, so those only count with the marker line OVERRIDE B
+      # demands. Inline review comments have no marker, but nothing else posts
+      # those under either login. --paginate: a PR can have far more than 100
+      # comments before Claude's.
+      - name: Fail if no comment was posted
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          count=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
+            --jq '.[] | select(.user.login == "claude[bot]" or (.user.login == "github-actions[bot]" and (.body | contains("## 🤖 Claude Code Review")))) | .id' \
+            | wc -l)
+          reviews=$(gh api --paginate "repos/$REPO/pulls/$PR/comments?per_page=100" \
+            --jq '.[] | select(.user.login == "claude[bot]" or .user.login == "github-actions[bot]") | .id' \
+            | wc -l)
+          echo "Claude review comments on PR #$PR: issue=$count inline=$reviews"
+          if [ "$count" -eq 0 ] && [ "$reviews" -eq 0 ]; then
+            echo "::error::Claude review finished without posting any comment on PR #$PR"
+            exit 1
+          fi
