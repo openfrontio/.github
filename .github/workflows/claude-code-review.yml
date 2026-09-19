@@ -197,6 +197,10 @@ jobs:
       # the action treats empty as "not provided" (`inputs.github_token ||
       # github.token`, `inputs.allowed_non_write_users != ''`), so the same
       # step serves both auth modes.
+      #
+      # allowed_bots: the action rejects bot actors by default, and PRs opened
+      # by claude-auto-fix.yml have claude[bot] as their actor. Only that one
+      # App is let through.
       - name: Claude multi-agent review (primary account)
         id: primary
         continue-on-error: true
@@ -205,6 +209,7 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ env.FORK_MODE == 'true' && secrets.GITHUB_TOKEN || '' }}
           allowed_non_write_users: ${{ env.FORK_MODE == 'true' && '*' || '' }}
+          allowed_bots: claude
           path_to_claude_code_executable: ${{ steps.install-claude.outputs.path }}
           plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
           plugins: "code-review@claude-code-plugins"
@@ -222,6 +227,7 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_BACKUP }}
           github_token: ${{ env.FORK_MODE == 'true' && secrets.GITHUB_TOKEN || '' }}
           allowed_non_write_users: ${{ env.FORK_MODE == 'true' && '*' || '' }}
+          allowed_bots: claude
           path_to_claude_code_executable: ${{ steps.install-claude.outputs.path }}
           plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
           plugins: "code-review@claude-code-plugins"
