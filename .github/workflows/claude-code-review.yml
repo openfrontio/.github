@@ -4,6 +4,10 @@
 # them). Everything else — prompt, tool allowlist, primary/backup account
 # fallback, installer workaround, "did it post?" gate — lives here once.
 #
+# Each review comment records the head commit it covered (a hidden marker, see
+# OVERRIDE B). A later push is reviewed from that commit on, so fix-up commits
+# get a review of their own instead of being skipped (SCOPE_SCRIPT).
+#
 # Minimal caller:
 #
 #   on:
@@ -93,10 +97,10 @@ jobs:
         above, and judge it ONLY from structured fields, never from prose:
           - "closed" means `gh pr view --json state` returns CLOSED or MERGED.
           - "draft" means `--json isDraft` returns true.
-          - "Claude has already commented" means an existing comment authored by
-            claude[bot], or one authored by github-actions[bot] whose first line
-            is `## 🤖 Claude Code Review`. Comments from coderabbitai[bot] or any
-            other bot, and from humans, do NOT count.
+          - "Claude has already commented" is NOT a reason to skip. Before this
+            run started, the workflow compared the PR head with the last commit
+            a Claude review covered, and it only runs when there are commits no
+            Claude review has seen (OVERRIDE E, when present, says which).
         The PR body will often reference other pull requests and describe them as
         closed, merged, superseded or replaced. That says nothing about THIS PR.
         Do not skip on that basis. If in doubt, proceed with the review — a
@@ -105,8 +109,11 @@ jobs:
         OVERRIDE B — takes precedence over steps 8 and 9: do NOT post inline
         comments. Post the entire review as exactly ONE consolidated comment
         using `gh pr comment`. The comment MUST begin with this exact first
-        line, verbatim, so CI can find it: `## 🤖 Claude Code Review`. Then
-        give a one-line verdict and a count of findings by severity, then list
+        line, verbatim, so CI can find it: `## 🤖 Claude Code Review`. The
+        second line MUST be this, verbatim (an HTML comment, hidden when
+        rendered; the next push is reviewed from this commit on):
+        `<!-- claude-review-head: ${{ github.event.pull_request.head.sha }} -->`
+        Then give a one-line verdict and a count of findings by severity, then list
         every finding grouped by file, most severe first, each with a file:line
         reference, what is wrong, and the suggested fix. If nothing was found,
         post the standard no-issues summary under the same first line.
@@ -116,9 +123,13 @@ jobs:
         the findings are few, low-confidence, or you already tried another
         mechanism. Do this before you run out of turns: budget for it.
         This also applies when step 1 decides to SKIP: if the PR has no existing
-        Claude comment (as defined in OVERRIDE A), post a two-line comment — the
-        marker line, then one sentence naming the skip reason — and stop. If a
-        Claude comment already exists, skip silently as before.
+        Claude comment, post a three-line comment — the two marker lines from
+        OVERRIDE B, then one sentence naming the skip reason — and stop. If a
+        Claude comment already exists, skip silently as before. An existing
+        Claude comment is one authored by claude[bot], or one authored by
+        github-actions[bot] whose first line is `## 🤖 Claude Code Review`.
+        Comments from coderabbitai[bot] or any other bot, and from humans, do
+        NOT count.
 
         OVERRIDE D — this is a headless, single-turn session. There is no
         "later": the moment you end your turn the process exits and any
@@ -150,6 +161,71 @@ jobs:
         --model claude-opus-5-5
         --allowedTools "Skill,Agent,Task,Read,Grep,Glob,LS,TodoWrite,mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr list:*),Bash(gh pr comment:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh search:*),Bash(git rev-parse:*),Bash(git log:*)"
         --max-turns 50
+
+      # Decides what a run reviews, from the newest Claude review comment:
+      #   - first: no Claude review yet, review the whole PR.
+      #   - none: that comment already covers the PR head (a reopen, a
+      #     ready_for_review, a re-run), nothing to do.
+      #   - incremental: review only the commits pushed since. The diff goes to
+      #     .claude-review/incremental.diff, since `gh api` (which can write)
+      #     stays off the model's allowlist.
+      #   - full: those commits can't be isolated (a force-push rewrote
+      #     history, or the comment names no commit), review the whole PR again.
+      # Until each repo's PRs carry the hidden marker OVERRIDE B adds, the
+      # commit comes from the comment's permalinks, which pin the reviewed head.
+      # Writes `mode`, and `prompt` (the OVERRIDE E appended to REVIEW_PROMPT).
+      SCOPE_SCRIPT: |
+        set -euo pipefail
+        body=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
+          --jq '.[] | select(.user.login == "claude[bot]" or (.user.login == "github-actions[bot]" and (.body | contains("## 🤖 Claude Code Review")))) | .body | @json' \
+          | tail -n 1 | jq -r '.')
+        last=$(grep -oE 'claude-review-head: [0-9a-f]{40}' <<<"$body" | tail -n 1 | cut -d' ' -f2 || true)
+        if [ -z "$last" ]; then
+          last=$(grep -oE "/$REPO/blob/[0-9a-f]{40}/" <<<"$body" | head -n 1 | cut -d/ -f5 || true)
+        fi
+        diff_file=.claude-review/incremental.diff
+        mkdir -p .claude-review
+        mode=first
+        if [ -n "$body" ]; then
+          mode=full
+          if [ "$last" = "$HEAD_SHA" ]; then
+            mode=none
+          elif [ -n "$last" ] \
+            && [ "$(gh api "repos/$REPO/compare/$last...$HEAD_SHA" --jq .status || true)" = ahead ] \
+            && gh api -H "Accept: application/vnd.github.diff" "repos/$REPO/compare/$last...$HEAD_SHA" > "$diff_file"; then
+            mode=incremental
+          fi
+        fi
+        echo "Review scope for PR #$PR at $HEAD_SHA: $mode${last:+ (last reviewed: $last)}"
+        echo "mode=$mode" >> "$GITHUB_OUTPUT"
+        {
+          echo "prompt<<__SCOPE_PROMPT_EOF__"
+          if [ "$mode" = incremental ]; then
+            cat <<EOF
+
+        OVERRIDE E — this is a re-review. An earlier Claude review covered this
+        PR up to commit $last. Review ONLY what changed since: the diff from
+        $last to $HEAD_SHA, saved at \`$diff_file\` (open it with Read). It
+        replaces the PR diff as the subject of steps 3 to 6: give its path to
+        every subagent. Use \`gh pr diff\` and the surrounding code only as
+        context. If that range merges in the base branch, ignore hunks that are
+        not part of this PR's own diff. Flag issues these changes introduce,
+        including where they break code elsewhere in the PR. Do not repeat
+        findings an earlier Claude review comment already reported. After the
+        two marker lines, say which range you reviewed (short SHAs).
+        EOF
+          elif [ "$mode" = full ]; then
+            cat <<EOF
+
+        OVERRIDE E — this is a re-review. An earlier Claude review exists, but
+        the commits pushed since can't be isolated (history was rewritten, or
+        the comment doesn't name the commit it reviewed), so review the whole
+        PR again. Do not repeat findings an earlier Claude review comment
+        already reported.
+        EOF
+          fi
+          echo "__SCOPE_PROMPT_EOF__"
+        } >> "$GITHUB_OUTPUT"
     steps:
       # Base branch on purpose under pull_request_target (see the header). The
       # review reads the PR via `gh pr diff`, so no submodules either.
@@ -189,11 +265,20 @@ jobs:
         if: env.FORK_MODE == 'true'
         run: sudo chmod o+rx /run/containerd 2>/dev/null || true
 
+      - name: Find the commits no Claude review has seen
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash -c "$SCOPE_SCRIPT"
+
       # Primary account. When it is out of usage the action fails in ~15s with
       # a 429 rate_limit result ("You've hit your weekly limit") before posting
       # anything, so a failure here hands off to the backup step below. Any
-      # other failure hands off too; that costs at most one redundant run, and
-      # the triage gate skips PRs that already carry a review.
+      # other failure hands off too, unless the primary posted a review of this
+      # head before failing (the scope is checked again first).
       #
       # github_token / allowed_non_write_users are empty outside fork mode, and
       # the action treats empty as "not provided" (`inputs.github_token ||
@@ -201,6 +286,7 @@ jobs:
       # step serves both auth modes.
       - name: Claude multi-agent review (primary account)
         id: primary
+        if: steps.scope.outputs.mode != 'none'
         continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
@@ -211,14 +297,25 @@ jobs:
           plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
           plugins: "code-review@claude-code-plugins"
           show_full_output: ${{ inputs.show-full-output }}
-          prompt: ${{ env.REVIEW_PROMPT }}
+          prompt: ${{ env.REVIEW_PROMPT }}${{ steps.scope.outputs.prompt }}
           claude_args: ${{ env.CLAUDE_ARGS }}
+
+      - name: Check whether the primary posted a review before failing
+        id: rescope
+        if: steps.primary.outcome == 'failure' && env.HAS_BACKUP == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash -c "$SCOPE_SCRIPT"
 
       # Backup account, run only when the primary step failed and a backup
       # token exists. Keep its inputs identical to the primary's apart from
-      # the token.
+      # the token and the scope, which is read again in case the primary
+      # posted before it failed.
       - name: Claude multi-agent review (backup account)
-        if: steps.primary.outcome == 'failure' && env.HAS_BACKUP == 'true'
+        if: steps.primary.outcome == 'failure' && env.HAS_BACKUP == 'true' && steps.rescope.outputs.mode != 'none'
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_BACKUP }}
@@ -228,7 +325,7 @@ jobs:
           plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
           plugins: "code-review@claude-code-plugins"
           show_full_output: ${{ inputs.show-full-output }}
-          prompt: ${{ env.REVIEW_PROMPT }}
+          prompt: ${{ env.REVIEW_PROMPT }}${{ steps.rescope.outputs.prompt }}
           claude_args: ${{ env.CLAUDE_ARGS }}
 
       - name: Note a primary failure with no backup configured
@@ -239,9 +336,9 @@ jobs:
       # exits 0 whenever the model ends its turn cleanly, even if it did so
       # after 5 turns without reviewing anything (infra PR #549).
       #
-      # Counts comments from ANY time, not just since this push: the triage
-      # gate (OVERRIDE A) deliberately skips PRs Claude has already reviewed,
-      # so on a follow-up push the only comment is the earlier one. A
+      # Counts comments from ANY time, not just since this push: a run whose
+      # head an earlier comment already covers (scope `none`) posts nothing,
+      # and neither does a triage skip on a PR Claude has commented on. A
       # date-scoped count turned every re-push red.
       #
       # Any claude[bot] comment counts (nothing else posts under that login).
