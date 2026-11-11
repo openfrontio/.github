@@ -84,6 +84,13 @@ jobs:
       FORK_MODE: ${{ github.event_name == 'pull_request_target' }}
       HAS_BACKUP: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_BACKUP != '' }}
 
+      # OVERRIDE F/G exist because, from at least 2026-10-21, almost every run
+      # on Opus 5.5 skipped the plugin's subagents entirely and read the diff
+      # alone (no Agent calls, 5-17 turns, under 2 minutes even for a ~3k-line
+      # PR). The plugin's "regardless of inputs" bar then dropped every
+      # reachable state-dependent bug as well. The "Warn if no subagent ran"
+      # step below catches a regression.
+      #
       # The override MUST live in the prompt (the user message), not in
       # claude_args. parse-sdk-options.ts only extracts model / max-turns /
       # add-dir / allowedTools / disallowed-tools / mcp-config / setting-sources
@@ -136,6 +143,41 @@ jobs:
         background agent is killed. Launch every subagent with
         `run_in_background: false` and wait for its result before continuing.
         Never end your turn to "wait" for anything. Do not call ScheduleWakeup.
+
+        OVERRIDE F — the review is done by agents, not by you. You may do
+        steps 1 and 2 yourself (OVERRIDE A already fixes the triage rules).
+        Steps 3, 4 and 5 MUST be run with the Agent tool exactly as the
+        command describes: the summary agent, then the four reviewers of
+        step 4 launched in ONE message so they run in parallel, then one
+        validator per issue in step 5 (also in one message). Reading the diff
+        yourself and posting your own verdict is NOT this review, however
+        small or clear the PR looks: a solo pass misses what the parallel
+        reviewers exist to catch. Your own job is to brief the agents, merge
+        and de-duplicate what they return, and post. Every agent's brief must
+        include the PR title and description, the text of OVERRIDE G, and
+        which diff to review.
+
+        OVERRIDE G — replaces the "CRITICAL: We only want HIGH SIGNAL issues"
+        block of step 4 and the matching test in step 5. Flag an issue when
+        you can name a concrete scenario that production can actually reach
+        and that makes the changed code produce a wrong result, lose or
+        double-count data or money, or grant access it shouldn't. Such
+        scenarios include a missing permission or a non-2xx response from an
+        external API, a retry after a partial failure, two requests racing on
+        the same row, and a row that another existing route can delete or
+        change. "It depends on specific inputs or state" is NOT a reason to
+        drop an issue whose state is reachable; those are the bugs that
+        matter. Still drop anything speculative, unreachable from the code as
+        it stands, purely stylistic, or a linter's job. Each issue must state
+        its scenario (inputs and state, then the wrong outcome), and a
+        step-5 validator confirms it by tracing that scenario through the
+        code, reading beyond the diff as needed.
+        Rules count wherever the repository writes them down: CLAUDE.md files,
+        and also explicit rule comments in code the change touches or calls
+        (for example a doc comment on an option saying when it must not be
+        set). The step-4 reviewers other than agent 3 should read the
+        definitions of the helpers, wrappers and options the change uses, and
+        quote any rule found there, as they would a CLAUDE.md rule.
 
       # Agent mode (an explicit `prompt`) grants NO tools by default — unlike
       # tag mode, which baselines Glob/Grep/LS/Read. Anything not listed here
@@ -315,6 +357,7 @@ jobs:
       # the token and the scope, which is read again in case the primary
       # posted before it failed.
       - name: Claude multi-agent review (backup account)
+        id: backup
         if: steps.primary.outcome == 'failure' && env.HAS_BACKUP == 'true' && steps.rescope.outputs.mode != 'none'
         uses: anthropics/claude-code-action@v1
         with:
@@ -327,6 +370,26 @@ jobs:
           show_full_output: ${{ inputs.show-full-output }}
           prompt: ${{ env.REVIEW_PROMPT }}${{ steps.rescope.outputs.prompt }}
           claude_args: ${{ env.CLAUDE_ARGS }}
+
+      # OVERRIDE F says the review is run by subagents. Before it, almost every
+      # run read the diff alone and posted a shallow verdict that looked
+      # identical to a real one. Warn-only, so a triage skip (which rightly
+      # launches nothing) doesn't turn the check red.
+      - name: Warn if no subagent ran
+        if: always() && steps.scope.outputs.mode != 'none'
+        env:
+          EXEC_FILE: ${{ steps.backup.outputs.execution_file || steps.primary.outputs.execution_file }}
+        run: |
+          set -euo pipefail
+          if [ -z "$EXEC_FILE" ] || [ ! -f "$EXEC_FILE" ]; then
+            echo "No execution file to check."
+            exit 0
+          fi
+          agents=$(jq '[.[] | select(.type == "assistant") | .message.content[]? | select(.type == "tool_use" and (.name == "Agent" or .name == "Task"))] | length' "$EXEC_FILE")
+          echo "Subagents launched: $agents"
+          if [ "$agents" -eq 0 ]; then
+            echo "::warning::The review launched no subagents, so it was a single solo pass, not the multi-agent review (expected only when it skipped at triage)."
+          fi
 
       - name: Note a primary failure with no backup configured
         if: steps.primary.outcome == 'failure' && env.HAS_BACKUP != 'true'
